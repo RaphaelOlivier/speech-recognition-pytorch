@@ -82,7 +82,7 @@ class ToySeq2Seq(torch.nn.Module):
 
 
 class Baseline(torch.nn.Module):
-    def __init__(self, nLabels, input_size=40, att_size=128, h_size_enc=256, h_size_dec=256, max_sentence=1000):
+    def __init__(self, nLabels, input_size=40, att_size=128, h_size_enc=256, h_size_dec=256, n_layers_dec=3, max_sentence=1000):
         super().__init__()
         self.encoderLSTM = torch.nn.LSTM(input_size=input_size, hidden_size=h_size_enc,
                                          num_layers=1, batch_first=False, bidirectional=True)
@@ -93,27 +93,19 @@ class Baseline(torch.nn.Module):
         self.encoderpLSTM3 = torch.nn.LSTM(input_size=4*h_size_enc, hidden_size=h_size_enc,
                                            num_layers=1, batch_first=False, bidirectional=True)
 
-        self.decoder_cell1 = torch.nn.LSTMCell(
-            input_size=h_size_dec+att_size, hidden_size=h_size_dec)
-        self.decoder_cell2 = torch.nn.LSTMCell(
-            input_size=h_size_dec, hidden_size=h_size_dec)
-        self.decoder_cell3 = torch.nn.LSTMCell(
-            input_size=h_size_dec, hidden_size=h_size_dec)
-
+        self.decoder = torch.nn.LSTM(input_size=h_size_dec+2*att_size, hidden_size=h_size_dec,
+                                     num_layers=n_layers_dec, batch_first=False, bidirectional=False)
+        self.n_layers_dec = n_layers_dec
         self.h_size_dec = h_size_dec
         self.att_size = att_size
         self.keyProjection = torch.nn.Linear(2*h_size_enc, att_size)
         self.valueProjection = torch.nn.Linear(2*h_size_enc, att_size)
         self.queryProjection = torch.nn.Linear(h_size_dec, att_size)
         self.sf_att = torch.nn.Softmax(dim=0)
-        self.characterProjection = torch.nn.Linear(h_size_dec, nLabels)
-        self.characterHidden = torch.nn.Linear(h_size_dec+att_size, h_size_dec)
+        self.characterProjection = torch.nn.Linear(h_size_dec+att_size, nLabels)
         self.max_sentence = max_sentence
         self.act = torch.nn.Softplus()
         self.input_size = input_size
-
-        self.initial_hidden_state = torch.nn.Parameter(torch.zeros(3, 1, h_size_dec).cuda())
-        self.initial_cell_state = torch.nn.Parameter(torch.zeros(3, 1, h_size_dec).cuda())
         """
         for param in self.characterProjection.parameters():
             torch.nn.init.uniform(param, -0.1, 0.1)
@@ -182,58 +174,44 @@ class Baseline(torch.nn.Module):
         return keys, values, attention_mask
 
     def attend(self, query, keys, values, attention_mask):
-        #print(keys.size(), query.size())
+        # print(keys.size(), query.size())
 
         scores = torch.mul(keys, query.expand_as(keys)).sum(dim=2, keepdim=True)
         # print(scores)
         # print(scores.data.numpy())
         # print(attention_mask)
         scores[attention_mask] = float("-Inf")
-        # print(scores.data.cpu().numpy())
+        # print(scores.data.numpy())
         scores = self.sf_att(scores)
 
-        # print(scores)
-        #print(scores.size(), values.size())
+        # print(scores.data.numpy())
+
         context = torch.mul(scores.expand_as(values), values).sum(dim=0)
         # print(context.size())
         return context
 
-    def decoder(self, inp, prev_state):
-
-        h1 = self.decoder_cell1(inp, prev_state[0])
-        h2 = self.decoder_cell2(h1[0], prev_state[1])
-        h3 = self.decoder_cell3(h2[0], prev_state[2])
-
-        return [h1, h2, h3]
-
     def decode_to_loss(self, input_sequence, lengths, golden_output):
-        # print(golden_output)
+        # print(golden_output.size())
         batch_size = golden_output.size(1)
-        # print(self.initial_hidden_state)
+
         keys, values, attention_mask = self.encode(input_sequence, lengths)
 
-        prev_state = [(h.expand(batch_size, self.h_size_dec), c.expand(batch_size, self.h_size_dec))
-                      for (h, c) in zip(self.initial_hidden_state, self.initial_cell_state)]
-        query = self.queryProjection(prev_state[2][0])
-        prev_context = self.attend(query, keys, values, attention_mask)
-
+        prev_context = datatools.to_variable(torch.zeros(1, batch_size, self.att_size))
+        prev_state = datatools.to_variable(torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec)), datatools.to_variable(
+            torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec))
         decoder_inputs = self.embed_target(golden_output)
-        # print(decoder_inputs.size())
         outputs_decoder = []
         for i in range(decoder_inputs.size(0)):
-            target_input = decoder_inputs[i, :, :]
-
+            target_input = decoder_inputs[i:i+1, :, :]
             # print(target_input.size(), prev_context.size())
-            inp = torch.cat([target_input, prev_context], dim=1)
-
-            new_state = self.decoder(inp, prev_state)
-            query = self.queryProjection(new_state[-1][0])
+            inp = torch.cat([target_input, prev_context], dim=2)
+            decoded, new_state = self.decoder(inp, prev_state)
+            query = self.queryProjection(decoded)
             new_context = self.attend(query, keys, values, attention_mask)
             # print(new_state[0][-1].size(), new_context.size())
-            output = self.characterProjection(self.act(self.characterHidden(
-                torch.cat([new_state[-1][0], new_context], dim=1))))
+            output = self.characterProjection(torch.cat([new_state[0][-1], new_context], dim=1))
             outputs_decoder.append(output.view(1, output.size(0), -1))
-            prev_state, prev_context = new_state, new_context
+            prev_state, prev_context = new_state, new_context.view(1, new_context.size(0), -1)
 
         outputs = torch.cat(outputs_decoder)
         # print(probs.size())
@@ -248,32 +226,30 @@ class Baseline(torch.nn.Module):
 
         keys, values, attention_mask = self.encode(input_sequence, lengths)
 
-        prev_state = [(h.expand(batch_size, self.h_size_dec), c.expand(batch_size, self.h_size_dec))
-                      for (h, c) in zip(self.initial_hidden_state, self.initial_cell_state)]
-        query = self.queryProjection(prev_state[2][0])
-        prev_context = self.attend(query, keys, values, attention_mask)
+        prev_context = datatools.to_variable(torch.zeros(1, batch_size, self.att_size))
+        prev_state = datatools.to_variable(torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec)), datatools.to_variable(
+            torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec))
+
         prev_char = 0
         characters = [0]
         new_char = None
         while new_char != 0:
             # print(torch.Tensor([[prev_char]]).long().size())
             target_input = self.embed_target(datatools.to_variable(
-                torch.Tensor([prev_char]).long()))
+                torch.Tensor([[prev_char]]).long()))
             # print(target_input.size(), prev_context.size())
-            inp = torch.cat([target_input, prev_context], dim=1)
-            new_state = self.decoder(inp, prev_state)
-            query = self.queryProjection(new_state[2][0])
+            inp = torch.cat([target_input, prev_context], dim=2)
+            decoded, new_state = self.decoder(inp, prev_state)
+            query = self.queryProjection(decoded)
             new_context = self.attend(query, keys, values, attention_mask)
-            output = self.characterProjection(self.act(self.characterHidden(
-                torch.cat([new_state[2][0], new_context], dim=1))))
+            output = self.characterProjection(torch.cat([new_state[0][-1], new_context], dim=1))
             # print(output.size())
-
             _, new_char = torch.max(output, dim=1)
             new_char = new_char.data.cpu().numpy()[0].item()
             if(len(characters) > self.max_sentence):
                 new_char = 0
             characters.append(new_char)
             prev_char = new_char
-            prev_state, prev_context = new_state, new_context
-
+            prev_state, prev_context = new_state, new_context.view(1, new_context.size(0), -1)
+        # print(probs.size())
         return characters
