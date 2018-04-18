@@ -21,12 +21,12 @@ def sub_path(x): return "../sub"+str(x)+".csv"
 
 
 net = models.Baseline(nLabels=len(vocab))
-#snet = routine.load_net("../net0.pt")
-
+net = routine.load_net("../net0.pt").cuda()
+net.max_sentence = 275
 
 net.train()
-routine.training(net, data, labels, Xd, Yd, 50, 16, 0.001, vocab)
+routine.training(net, data, labels, Xd, Yd, 20, 16, 0.00001, vocab)
 
 print("Writing submission")
 net.eval()
-routine.write_sub(net, Xt, sub_path(""), vocab)
+routine.write_sub(net, Xt, sub_path(""), vocab, random=True, random_number=100)

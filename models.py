@@ -8,79 +8,6 @@ import datatools
 import torch.nn.functional as F
 
 
-class ToySeq2Seq(torch.nn.Module):
-    def __init__(self, input_size, h_size, n_layers, nLabels, max_sentence=100):
-        super().__init__()
-        self.encoder = torch.nn.LSTM(input_size=input_size, hidden_size=h_size,
-                                     num_layers=n_layers, batch_first=False, bidirectional=False)
-        self.decoder = torch.nn.LSTM(input_size=h_size, hidden_size=h_size,
-                                     num_layers=n_layers, batch_first=True, bidirectional=False)
-
-        self.characterProjection = torch.nn.Linear(h_size, nLabels)
-        self.max_sentence = max_sentence
-        self.act = torch.nn.Softplus()
-        self.input_size = input_size
-        for param in self.characterProjection.parameters():
-            torch.nn.init.uniform(param, -0.1, 0.1)
-        born = 1. / np.sqrt(h_size)
-        for param in self.encoder.parameters():
-            torch.nn.init.uniform(param, -born, born)
-        for param in self.decoder.parameters():
-            torch.nn.init.uniform(param, -born, born)
-
-    def embed_target(self, inp):
-        return self.act(F.embedding(inp, self.characterProjection.weight))
-
-    def forward(self, input_sequence, lengths=None, output_sequence=None, mode="train"):
-        # input_sequence: Padded sequence
-        if mode == "train":
-            return self.decode_to_loss(input_sequence, lengths, output_sequence)
-        else:
-            return self.decode_to_prediction(input_sequence)
-
-    def decode_to_loss(self, input_sequence, lengths, golden_output):
-        packed = pack_padded_sequence(input_sequence, lengths, batch_first=True)
-        _, state = self.encoder(packed)
-        # print(state[0].size())
-        ar = Variable(torch.zeros(1).cuda())
-        # print(unpacked.size())
-        decoder_input = self.embed_target(golden_output)
-        # print(decoder_input.size())
-        decoded, _ = self.decoder(decoder_input, state)
-
-        outputs = self.characterProjection(decoded)
-        # print(probs.size())
-        return outputs, ar
-
-    def decode_to_prediction(self, input_sequence):
-        packed = input_sequence.view(-1, 1, self.input_size)
-        _, state = self.encoder(packed)
-        w = Variable(torch.zeros(1)).long().view(1, 1)
-        l = [0]
-
-        # first iteration
-        inp = self.embed_target(w)
-        h, state = self.decoder(inp, state)
-        out = self.characterProjection(h)
-        _, ind = torch.max(out, dim=2)
-        word = ind.data.numpy()[0, 0]
-        l.append(word)
-        print(word)
-        while(word != 0):
-
-            inp = self.embed_target(w)
-            h, state = self.decoder(inp, state)
-            out = self.characterProjection(h)
-            # print(out)
-            _, ind = torch.max(out, dim=2)
-            word = ind.data.numpy()[0, 0]
-            if(len(l) > 100):
-                word = 0
-            l.append(word)
-            # print(word)
-        return np.array(l)
-
-
 class Baseline(torch.nn.Module):
     def __init__(self, nLabels, input_size=40, att_size=128, h_size_enc=256, h_size_dec=256, n_layers_dec=3, max_sentence=1000):
         super().__init__()
@@ -103,9 +30,12 @@ class Baseline(torch.nn.Module):
         self.queryProjection = torch.nn.Linear(h_size_dec, att_size)
         self.sf_att = torch.nn.Softmax(dim=0)
         self.characterProjection = torch.nn.Linear(h_size_dec+att_size, nLabels)
+        #self.characterHidden = torch.nn.Linear(h_size_dec+att_size, h_size_dec)
         self.max_sentence = max_sentence
-        self.act = torch.nn.Softplus()
+        self.act = torch.nn.LeakyReLU()
         self.input_size = input_size
+        self.drop = torch.nn.Dropout(0.2)
+        self.droplstm = LockedDropout(0.1)
         """
         for param in self.characterProjection.parameters():
             torch.nn.init.uniform(param, -0.1, 0.1)
@@ -119,15 +49,18 @@ class Baseline(torch.nn.Module):
     def embed_target(self, inp):
         return self.act(F.embedding(inp, self.characterProjection.weight))
 
-    def forward(self, input_sequence, lengths=None, output_sequence=None, mode="train"):
+    def forward(self, input_sequence, lengths=None, output_sequence=None, mode="train", n_preds=None):
         # input_sequence: Padded sequence
         if mode == "train":
             return self.decode_to_loss(input_sequence, lengths, output_sequence)
-        else:
+        elif mode == "eval":
             return self.decode_to_prediction(input_sequence)
+        elif mode == "random":
+            return self.random_search(input_sequence, n_preds=n_preds)
 
     def pool_and_encode(self, prev_o, lstm):
         i, lengths = pad_packed_sequence(prev_o, batch_first=True)
+        i = self.droplstm(i)
         # print(i.size())
         if i.size(1) % 2 == 1:
             i = i[:, :-1, :]
@@ -156,6 +89,7 @@ class Baseline(torch.nn.Module):
         # print(pad_packed_sequence(o3)[0].size())
 
         output_encoder, new_lengths = pad_packed_sequence(o3, batch_first=False)
+        output_encoder = self.droplstm(output_encoder)
 
         # print(new_lengths)
         keys = torch.cat([self.keyProjection(out).view(1, -1, self.att_size)
@@ -188,10 +122,12 @@ class Baseline(torch.nn.Module):
 
         context = torch.mul(scores.expand_as(values), values).sum(dim=0)
         # print(context.size())
-        return context
+        return context, l1_penalty(scores)
 
     def decode_to_loss(self, input_sequence, lengths, golden_output):
         # print(golden_output.size())
+        ar = datatools.to_variable(torch.zeros(1))
+
         batch_size = golden_output.size(1)
 
         keys, values, attention_mask = self.encode(input_sequence, lengths)
@@ -206,16 +142,19 @@ class Baseline(torch.nn.Module):
             # print(target_input.size(), prev_context.size())
             inp = torch.cat([target_input, prev_context], dim=2)
             decoded, new_state = self.decoder(inp, prev_state)
-            query = self.queryProjection(decoded)
-            new_context = self.attend(query, keys, values, attention_mask)
+            query = self.queryProjection(self.drop(decoded))
+            new_context, lasso = self.attend(query, keys, values, attention_mask)
             # print(new_state[0][-1].size(), new_context.size())
-            output = self.characterProjection(torch.cat([new_state[0][-1], new_context], dim=1))
+            output = self.characterProjection(
+                self.drop(torch.cat([new_state[0][-1], new_context], dim=1)))
             outputs_decoder.append(output.view(1, output.size(0), -1))
             prev_state, prev_context = new_state, new_context.view(1, new_context.size(0), -1)
 
         outputs = torch.cat(outputs_decoder)
+        ar += l2_penalty(outputs) + lasso
+
         # print(probs.size())
-        return outputs
+        return outputs, ar
 
     def decode_to_prediction(self, input_sequence, vocab=None):
         # only one sentence
@@ -241,7 +180,7 @@ class Baseline(torch.nn.Module):
             inp = torch.cat([target_input, prev_context], dim=2)
             decoded, new_state = self.decoder(inp, prev_state)
             query = self.queryProjection(decoded)
-            new_context = self.attend(query, keys, values, attention_mask)
+            new_context, lasso = self.attend(query, keys, values, attention_mask)
             output = self.characterProjection(torch.cat([new_state[0][-1], new_context], dim=1))
             # print(output.size())
             _, new_char = torch.max(output, dim=1)
@@ -253,3 +192,122 @@ class Baseline(torch.nn.Module):
             prev_state, prev_context = new_state, new_context.view(1, new_context.size(0), -1)
         # print(probs.size())
         return characters
+
+    def random_search(self, input_sequence, vocab=None, n_preds=100):
+        # only one sentence
+        print("new sentence")
+        sf = torch.nn.Softmax(dim=1)
+        prev_characters = []
+        prev_logprob = datatools.to_variable(torch.Tensor([float("-Inf")]))
+
+        input_sequence = input_sequence.view(input_sequence.size(0), 1, input_sequence.size(1))
+        lengths = [input_sequence.size(0)]
+
+        batch_size = 1
+
+        keys, values, attention_mask = self.encode(input_sequence, lengths)
+
+        for i in range(n_preds):
+            total_logprob = 0
+
+            prev_context = datatools.to_variable(torch.zeros(1, batch_size, self.att_size))
+            prev_state = datatools.to_variable(torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec)), datatools.to_variable(
+                torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec))
+
+            prev_char = 0
+            characters = [0]
+            new_char = None
+            while new_char != 0:
+                # print(torch.Tensor([[prev_char]]).long().size())
+                target_input = self.embed_target(datatools.to_variable(
+                    torch.Tensor([[prev_char]]).long()))
+                # print(target_input.size(), prev_context.size())
+                inp = torch.cat([target_input, prev_context], dim=2)
+                decoded, new_state = self.decoder(inp, prev_state)
+                query = self.queryProjection(decoded)
+                new_context, lasso = self.attend(query, keys, values, attention_mask)
+                output = self.characterProjection(torch.cat([new_state[0][-1], new_context], dim=1))
+                probs = sf(output)
+                # print(output.size())
+                sample = torch.rand(1)
+                new_char = -1
+                acc = datatools.to_variable(torch.zeros(1))
+                # print(acc.size())
+                # print(probs.size())
+                while(acc.data[0] < sample[0]):
+                    new_char += 1
+                    acc += probs[0, new_char]
+
+                # new_char = new_char.data.cpu().numpy()[0].item()
+                if(len(characters) > self.max_sentence):
+                    new_char = 0
+                    total_logprob -= 1000
+                characters.append(new_char)
+                total_logprob += torch.log(probs[0, new_char])
+                prev_char = new_char
+                prev_state, prev_context = new_state, new_context.view(1, new_context.size(0), -1)
+            total_logprob /= len(characters)
+            if(total_logprob.data[0] > prev_logprob.data[0]):
+                prev_logprob = total_logprob
+                prev_characters = characters
+                print("for search", i, ": prob", prev_logprob.data[0])
+                # print(prev_characters)
+        # print(probs.size())
+        prev_context = datatools.to_variable(torch.zeros(1, batch_size, self.att_size))
+        prev_state = datatools.to_variable(torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec)), datatools.to_variable(
+            torch.zeros(self.n_layers_dec, batch_size, self.h_size_dec))
+
+        prev_char = 0
+        characters = [0]
+        new_char = None
+        total_logprob = 0
+        while new_char != 0:
+            # print(torch.Tensor([[prev_char]]).long().size())
+            target_input = self.embed_target(datatools.to_variable(
+                torch.Tensor([[prev_char]]).long()))
+            # print(target_input.size(), prev_context.size())
+            inp = torch.cat([target_input, prev_context], dim=2)
+            decoded, new_state = self.decoder(inp, prev_state)
+            query = self.queryProjection(decoded)
+            new_context, lasso = self.attend(query, keys, values, attention_mask)
+            output = self.characterProjection(torch.cat([new_state[0][-1], new_context], dim=1))
+            probs = sf(output)
+            # print(output.size())
+            _, new_char = torch.max(output, dim=1)
+            new_char = new_char.data.cpu().numpy()[0].item()
+            if(len(characters) > self.max_sentence):
+                new_char = 0
+                total_logprob -= 1000
+
+            characters.append(new_char)
+            prev_char = new_char
+            prev_state, prev_context = new_state, new_context.view(1, new_context.size(0), -1)
+            total_logprob += torch.log(probs[0, new_char])
+        total_logprob /= len(characters)
+        print("for greedy search : prob", total_logprob.data[0])
+        if(total_logprob.data[0] > prev_logprob.data[0]):
+            prev_logprob = total_logprob
+            prev_characters = characters
+        return prev_characters
+
+
+def l1_penalty(var):
+    return torch.abs(var).sum()
+
+
+def l2_penalty(var):
+    return torch.sqrt(torch.pow(var, 2).sum())
+
+
+class LockedDropout(torch.nn.Module):
+    def __init__(self, p=None):
+        super(LockedDropout, self).__init__()
+        self.dropout = p
+
+    def forward(self, x):
+        if not self.training or not self.dropout:
+            return x
+        m = x.data.new(1, x.size(1), x.size(2)).bernoulli_(1 - self.dropout)
+        mask = Variable(m, requires_grad=False) / (1 - self.dropout)
+        mask = mask.expand_as(x)
+        return mask * x

@@ -55,16 +55,18 @@ def pad_sequence(sequences, batch_first=False, padding_value=0):
     return out_variable
 
 
-def predict(net, X, vocab=None):
+def predict(net, X, vocab=None, random=False, random_number=100):
 
     n = len(X)
-
     Y = list()
+    mode = "eval"
+    if(random):
+        mode = "random"
     for s in X:
         input_val = s
         input_val = datatools.to_tensor(input_val)
         pred = net.forward(datatools.to_variable(input_val),
-                           mode="eval")
+                           mode=mode, n_preds=random_number)
         Y.append(pred)
         if(vocab is not None):
             print(datatools.to_string_char(np.array([pred]), vocab))
@@ -162,7 +164,7 @@ def training(net, train_data, train_labels, dev_data, dev_labels, num_epochs, mi
                 -1, 1) >= (label_lengths-1).reshape((-1, label.size(1)))).astype(int)).cuda().byte()
             # print(label_to_mask)
 
-            prediction = net(input_val, lengths, label[:-1, :], mode="train")
+            prediction, ar = net(input_val, lengths, label[:-1, :], mode="train")
 
             # print(label.data.cpu().numpy())
             # print(np.unique(label.data.cpu().numpy())) # [1-46] as expected
@@ -177,7 +179,7 @@ def training(net, train_data, train_labels, dev_data, dev_labels, num_epochs, mi
             # print(loss.size(), label_to_mask.size())
             loss[label_to_mask] = 0
             # print(loss)
-            loss = (torch.sum(loss))/minibatch_size
+            loss = (torch.sum(loss)+0.0001*ar)/minibatch_size
             # loss = loss_fn(prediction[:1, :1],
             #               label[:1], output_lengths[:1]/output_lengths[0], label_lengths)
 
@@ -232,7 +234,7 @@ def training(net, train_data, train_labels, dev_data, dev_labels, num_epochs, mi
                 -1, 1) >= (label_lengths-1).reshape((-1, label.size(1)))).astype(int)).cuda().byte()
             # print(label_to_mask)
 
-            prediction = net(input_val, lengths, label[:-1, :], mode="train")
+            prediction, ar = net(input_val, lengths, label[:-1, :], mode="train")
 
             # print(label.data.cpu().numpy())
             # print(np.unique(label.data.cpu().numpy())) # [1-46] as expected
@@ -281,14 +283,14 @@ def load_net(path):
     return torch.load(path)
 
 
-def write_sub(net, Xt, sub_path, vocab):
+def write_sub(net, Xt, sub_path, vocab, random=False, random_number=100):
     #testX = datatools.normalize(testX)
-    testY = predict(net, Xt, vocab)
+    testY = predict(net, Xt, vocab, random, random_number)
     print("prediction shape : "+str(testY.shape))
     test_sub = np.array([np.arange(testY.shape[0]), datatools.to_string_char(testY, vocab)]).T
     print(test_sub)
     np.savetxt(sub_path, test_sub, delimiter=",",
-               header="id,label", comments="", fmt="%1s")
+               header="id,Predicted", comments="", fmt="%1s")
 
 
 def stack_nets(path1, path2, path3):
